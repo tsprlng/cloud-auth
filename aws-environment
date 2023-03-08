@@ -1,0 +1,52 @@
+#!/usr/bin/env ruby
+
+require 'fileutils'
+require 'yaml'
+
+def list_envs
+	envs = YAML.load_file(File.join(__dir__, '../../environments.yml'))['environments']
+	# TODO fix this path to be relative, when this is moved into the repo
+	# TODO AND THE OTHER COPY BELOW
+	envs.filter{|name, e| is_aws_env(e) }.keys
+end
+
+def is_aws_env(environment)
+	environment['infra_version'].start_with?('aws-')
+end
+
+if ARGV.delete('--list-envs')
+	puts list_envs
+	exit 0
+end
+
+EnvironmentName = ARGV.shift
+unless EnvironmentName and not ARGV.empty?
+	baseName = File.basename($0)
+	$stderr.puts "Usage: #{baseName} <env-name> <aws-command ...>"
+	$stderr.puts "       #{baseName} <env-name> -- <command ...>"
+	$stderr.puts "       #{baseName} --list-envs"
+	$stderr.puts
+	$stderr.puts "Environments:"
+	$stderr.puts "  #{list_envs.join(' ')}"
+	exit 1
+end
+
+Environments = YAML.load_file(File.join(__dir__, '../../environments.yml'))['environments']
+Environment = Environments[EnvironmentName]
+unless Environment and is_aws_env(Environment)
+	$stderr.puts "Not a AWS environment. Try one of these:"
+	$stderr.puts "  #{list_envs.join(' ')}"
+	exit 2
+end
+
+# Set this variable so that our tools (like the Terraform wrapper) can pick up the environment we're working on in a standard way
+ENV[AwsEnvironmentEnvVar] = EnvironmentName
+
+# Set default region for things using the aws tool, or standard aws libraries, to conveniently match the environment
+ENV['AWS_DEFAULT_REGION'] = Environment['region']
+ENV['AWS_REGION'] = Environment['region']
+
+# Now delegate to the command we were called with -- via the other wrapper (same style args), which actually authenticates us against the correct account for the environment
+AccountName = Environment['production_account'] || 'dev'
+ENV[AwsAccountEnvVar] = AccountName
+exec('aws-account', AccountName, *ARGV)

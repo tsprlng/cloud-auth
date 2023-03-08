@@ -1,0 +1,107 @@
+#!/usr/bin/env ruby
+
+require 'fileutils'
+require 'yaml'
+
+require_relative 'lib/config'
+
+def list_projects
+	accounts = YAML.load_file(File.join(__dir__, '../../accounts.yml'))['accounts']['gcp']
+	accounts.map{|aname, a| a['projects'].keys }.flatten
+end
+
+if ARGV.delete('--list-projects')
+	puts list_projects
+	exit 0
+end
+
+ProjectName = ARGV.shift
+unless ProjectName
+	$stderr.puts "Usage: #{$0} <project-id> <gcloud-command...>"
+	$stderr.puts "       #{$0} <project-id> -- <command...>"
+	$stderr.puts "       #{$0} --list-projects"
+	$stderr.puts
+	$stderr.puts "Projects:"
+	$stderr.puts "  #{list_projects.join(' ')}"
+	exit 1
+end
+
+Accounts = YAML.load_file(File.join(__dir__, '../../accounts.yml'))['accounts']['gcp']
+AccountName, Account = Accounts.find{|aname, a| Project = a['projects'][ProjectName] }
+ProjectId = Project['google_id'] || ProjectName
+
+unless Account and Project and ProjectId
+	$stderr.puts "Not a GCP project. Try one of these:"
+	$stderr.puts "  #{list_projects.join(' ')}"
+	exit 2
+end
+
+RealGcloudCommand = Config('infrastructure.gcp.native-gcloud-tool', 'gcloud')  # full path to your gcloud command e.g '/home/whoever/gcloud/google-cloud-sdk/bin/gcloud'
+
+# Make a separate config dir for company gcloud stuff, separate from your system default
+GcloudConfigDir = Config.cache_dir('gcloud-config', 'infrastructure.gcp.auth-script.config-dir')
+TokenCacheDir = Config.cache_dir('gcloud-tokens', 'infrastructure.gcp.auth-script.token-cache-dir')
+FileUtils.mkdir_p(GcloudConfigDir)
+FileUtils.mkdir_p(TokenCacheDir)
+
+# We'll use a separate gcloud "configuration" for each project, to make it easy to activate one of them with the built-in var $CLOUDSDK_ACTIVE_CONFIG_NAME
+GcloudConfigurationName = "#{CompanyDirName}-#{ProjectName}"
+
+# When we create this "configuration" we expect it to store it as a file here:
+GcloudConfigurationFile = File.join(GcloudConfigDir, 'configurations', "config_#{GcloudConfigurationName}")
+
+ENV['CLOUDSDK_CONFIG'] = GcloudConfigDir
+ENV['CLOUDSDK_ACTIVE_CONFIG_NAME'] = GcloudConfigurationName
+
+Username = Config("infrastructure.gcp.account-auth.username", nil)
+raise "Username not found in config" unless Username
+
+# Make the project-specific configuration, if it's not already there
+unless File.exist?(GcloudConfigurationFile)
+	system(RealGcloudCommand, 'config', 'configurations', 'create', '--no-activate', GcloudConfigurationName)
+
+	# Check it worked and they haven't changed the storage path
+	unless File.exist?(GcloudConfigurationFile)
+		raise "Config file creation failed, or path wasn't as expected: #{GcloudConfigurationFile}"
+	end
+end
+
+# Set project and account, if the configuration didn't already have these set (or if the format is no longer the one we recognize)
+current_config = File.read(GcloudConfigurationFile)
+unless /project\s*=\s*#{ProjectName}/ =~ current_config
+	system(RealGcloudCommand, 'config', 'set', 'project', ProjectId)
+end
+unless /account\s*=\s*#{Username}/ =~ current_config
+	system(RealGcloudCommand, 'config', 'set', 'account', Username)
+end
+
+ENV[GcpProjectEnvVar] = ProjectName
+
+$_cache_token = nil
+def get_token
+	return $_cache_token if $_cache_token
+
+	filename = File.join(TokenCacheDir, ProjectId)
+	read = File.read(filename).strip rescue nil
+	return read if read
+
+	$stderr.puts("fetching token...")
+	token = `"#{RealGcloudCommand}" auth print-access-token --project "#{ProjectId}"`.strip
+	$stderr.puts("writing to #{filename}...")
+	File.write(filename, "#{token}\n")
+	token
+end
+
+# This needs to be exported for the google terraform provider to use
+# It's probably not the best way but at least it works, for now
+# See https://registry.terraform.io/providers/hashicorp/google/latest/docs/guides/provider_reference#access_token
+ENV['GOOGLE_OAUTH_ACCESS_TOKEN'] = get_token
+
+if ARGV.empty?
+	exec(RealGcloudCommand)
+		# meh, nothing special to do, so just print the gcloud menu
+elsif ['-','--'].include? ARGV[0]
+	exec(*ARGV[1..-1])
+else
+	exec(RealGcloudCommand, *ARGV)
+end

@@ -1,0 +1,52 @@
+#!/usr/bin/env ruby
+
+require 'fileutils'
+require 'yaml'
+
+def list_envs
+	envs = YAML.load_file(File.join(__dir__, '../../environments.yml'))['environments']
+	# TODO fix this path to be relative, when this is moved into the repo
+	# TODO AND THE OTHER COPY BELOW
+	envs.filter{|name, e| is_gcp_env(e) }.keys
+end
+
+def is_gcp_env(environment)
+	environment['infra_version'].start_with?('gcp-')
+end
+
+if ARGV.delete('--list-envs')
+	puts list_envs
+	exit 0
+end
+
+EnvironmentName = ARGV.shift
+unless EnvironmentName and not ARGV.empty?
+	baseName = File.basename($0)
+	$stderr.puts "Usage: #{baseName} <env-name> <gcloud-command ...>"
+	$stderr.puts "       #{baseName} <env-name> -- <command ...>"
+	$stderr.puts "       #{baseName} --list-envs"
+	$stderr.puts
+	$stderr.puts "Environments:"
+	$stderr.puts "  #{list_envs.join(' ')}"
+	exit 1
+end
+
+Environments = YAML.load_file(File.join(__dir__, '../../environments.yml'))['environments']
+Environment = Environments[EnvironmentName]
+unless Environment and is_gcp_env(Environment)
+	$stderr.puts "Not a GCP environment. Try one of these:"
+	$stderr.puts "  #{list_envs.join(' ')}"
+	exit 2
+end
+
+# Set this variable so that our tools (like the Terraform wrapper) can pick up the environment we're working on in a standard way
+ENV[GcpEnvironmentEnvVar] = EnvironmentName
+
+# Set default region/zone for things using the gcloud tool, or standard gcloud SDK, to conveniently match the environment
+ENV['CLOUDSDK_COMPUTE_REGION'] = Environment['region']
+ENV['CLOUDSDK_COMPUTE_ZONE'] = Environment['zone']
+
+# Now delegate to the command we were called with -- via the other wrapper (same style args), which actually authenticates us against the correct account for the environment
+ProjectName = Environment['gcp-project']
+ENV[GcpProjectEnvVar] = ProjectName
+exec('gcp-project', ProjectName, *ARGV)

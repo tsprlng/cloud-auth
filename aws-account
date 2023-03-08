@@ -1,0 +1,153 @@
+#!/usr/bin/env ruby
+
+require 'fileutils'
+require 'yaml'
+
+require_relative 'lib/config'
+
+def list_accts
+	accts = YAML.load_file(File.join(__dir__, '../../accounts.yml'))['accounts']['aws']
+	accts.keys.reject{|a| a=='root' }
+end
+
+if ARGV.delete('--list-accounts')
+	puts list_accts
+	exit 0
+end
+
+AccountName = ARGV.shift
+unless AccountName and not ARGV.empty?
+	baseName = File.basename($0)
+	$stderr.puts "Usage: #{baseName} <acct-name> <aws-command ...>"
+	$stderr.puts "       #{baseName} <acct-name> -- <command ...>"
+	$stderr.puts "       #{baseName} <acct-name> --session-info"
+	$stderr.puts "       #{baseName} --list-accounts"
+	$stderr.puts
+	$stderr.puts "Accounts:"
+	$stderr.puts "  #{list_accts.join(' ')}"
+	exit 1
+end
+
+Accounts = YAML.load_file(File.join(__dir__, '../../accounts.yml'))['accounts']['aws']
+Account = Accounts[AccountName]
+AccountId = Account['account_id']
+unless Account and AccountId
+	$stderr.puts "Not a AWS account. Try one of these:"
+	$stderr.puts "  #{list_accts.join(' ')}"
+	exit 2
+end
+
+# AWS CLI proxy that handles temporary authentication (assuming role with MFA)
+
+RealAwsCommand = Config('infrastructure.aws.native-aws-tool', 'aws')  # normal aws cli binary to exec after auth
+RemainingSecsThreshold = 15*60  # minimum time that can be left on a token before renewing
+
+User = Config('infrastructure.aws.account-auth.username')
+ApiSecretId = Config('infrastructure.aws.account-auth.id')
+ApiSecret = Config('infrastructure.aws.account-auth.secret')
+	# Credentials to use for the root account, before switching role into one of the other accounts
+
+TryTokenCommand = Config('infrastructure.aws.account-auth.mfa-token-command', nil)
+	# Command that may return the 6-digit TOTP token on this machine
+
+UseFaketime = Config('infrastructure.aws.account-auth-script.faketime', false)
+	# Useful to enable if you have the `faketime` binary available and use an MFA token script. Then we can automatically get different OTPs to switch to the different accounts -- each one can only be used once; it's literally enforced by AWS.
+
+MfaTokenArn = "arn:aws:iam::#{Accounts['root']['account_id']}:mfa/#{User}"
+RoleArn = "arn:aws:iam::#{AccountId}:role/#{ENV['AWS_ROLE'] || 'AdminAccessRole'}"
+
+SessionDir = Config.cache_dir('aws-sessions', 'infrastructure.aws.account-auth-script.session-dir')
+FileUtils.mkdir_p(SessionDir)
+SessionFile = File.join(SessionDir, RoleArn.gsub(/[\/:_]+/, '-'))
+
+require 'json'
+require 'date'
+
+$faketime = 0  # trick to do multiple auto-logins within the same MFA interval; cheating by faking being in the next interval or two
+
+def tryLogIn
+	raise "Must specify user name" if User.nil? or User.empty?
+	ok = false
+	if TryTokenCommand
+		token = `#{$faketime ? "faketime -f +#{$faketime}s " : ''}#{TryTokenCommand}`.strip
+		ok = $?.success?
+	end
+	until ok and /^\d{6}$/ =~ token
+		$stderr.print "Enter TOTP token: "
+		token = $stdin.gets.strip
+		ok = true
+	end
+
+	if ApiSecretId and ApiSecret
+		ENV['AWS_ACCESS_KEY_ID'] = ApiSecretId
+		ENV['AWS_SECRET_ACCESS_KEY'] = ApiSecret
+		ENV.delete('AWS_SESSION_TOKEN')
+	end
+
+	`#{RealAwsCommand} --region us-west-2 sts assume-role --role-arn '#{RoleArn}' --role-session-name '#{User}-cli' --serial-number '#{MfaTokenArn}' --token-code '#{token}'`
+end
+
+def logIn
+	tries = 0
+	awsResponse = "No response from assume-role call:\\"
+	begin
+		tries += 1
+		awsResponse = tryLogIn
+		parsed = JSON.load(awsResponse)['Credentials']
+		File.open(File.expand_path(SessionFile), 'w') do |sessionFile|
+			sessionFile.chmod(0600)
+			sessionFile.write(JSON.dump(parsed))
+		end
+		FileUtils.touch(File.expand_path(SessionFile), mtime: Time.now.to_i+$faketime)
+		return parsed
+	rescue
+		$stderr.puts awsResponse unless awsResponse.nil? or awsResponse.empty?
+		$stderr.puts "Retrying login..."
+		retry unless tries >= 3
+		raise $!
+	end
+end
+
+if UseFaketime then
+	Dir.chdir(SessionDir) do
+		latest_mtime = 0
+		Dir.glob('*').each do |f|
+			mtime = File.stat(f).mtime.utc.to_i
+			if mtime > latest_mtime
+				latest_mtime = mtime
+			end
+		end
+		while (latest_mtime / 30) >= ((Time.now.utc.to_i+$faketime) / 30)
+			# already logged in during this 30 second interval!
+			# we have to fake believing we're in the future for it to let us in again (e.g. to a different acct or role)
+			$faketime = $faketime + 30
+		end
+		#$stderr.puts "Faking time #{$faketime}"
+	end
+end
+
+begin
+	creds = JSON.load(File.read(File.expand_path(SessionFile)))
+	expires = DateTime.strptime(creds['Expiration'])
+	must_expire_after = DateTime.now + Rational(RemainingSecsThreshold, 60*60*24)
+	raise "Too Late" unless expires > must_expire_after
+rescue
+	creds = logIn
+	raise "Credentials weren't returned" unless creds
+end
+
+ENV['AWS_ACCESS_KEY_ID'] = creds['AccessKeyId'] || raise
+ENV['AWS_SECRET_ACCESS_KEY'] = creds['SecretAccessKey'] || raise
+ENV['AWS_SESSION_TOKEN'] = creds['SessionToken'] || raise
+
+if ARGV.delete('--session-info')
+	expires = DateTime.strptime(creds['Expiration'])
+	remaining_secs = ((expires - DateTime.now) * 24 * 60 * 60).to_i
+	puts "Logged in. Session expires in #{remaining_secs/60}m#{remaining_secs%60}s."
+
+elsif ['-','--'].include? ARGV[0]
+	exec(*ARGV[1..-1])
+
+else
+	exec(RealAwsCommand, *ARGV)
+end

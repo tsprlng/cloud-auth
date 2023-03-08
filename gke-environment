@@ -1,0 +1,82 @@
+#!/usr/bin/env ruby
+
+require 'fileutils'
+require 'yaml'
+
+require_relative 'lib/config'
+
+Environments = YAML.load_file(File.join(__dir__, '../../environments.yml'))['environments']
+
+def list_envs
+	valid_envs = []
+	Environments.each do |name, e|
+		valid_envs << name if e['infra_version'] == 'gke-cluster'
+	end
+	valid_envs.join(' ')
+end
+
+if ARGV.delete('--list-envs')
+	puts list_envs
+	exit 0
+end
+
+EnvironmentName = ARGV.shift
+unless EnvironmentName and not ARGV.empty?
+	baseName = File.basename($0)
+	$stderr.puts "Usage: #{baseName} <env-name> <kubectl-command ...>"
+	$stderr.puts "       #{baseName} <env-name> -- <command ...>"
+	$stderr.puts "       #{baseName} --list-envs"
+	$stderr.puts
+	$stderr.puts "Environments:"
+	$stderr.puts "  #{list_envs}"
+	exit 1
+end
+
+Environment = Environments[EnvironmentName]
+unless Environment and Environment['infra_version'] == 'gke-cluster'
+	$stderr.puts "Not a GKE environment. Try one of these:"
+	$stderr.puts "  #{list_envs}"
+	exit 2
+end
+
+SessionDir = Config.cache_dir(File.join('gke-sessions', EnvironmentName))
+	# each env seems to probably need its own directory, as the shitty gke gcloud auth plugin dumps a cache file here with a non-varying name
+FileUtils.mkdir_p(SessionDir)
+SessionFile = File.join(SessionDir, 'session')
+ENV['KUBECONFIG'] = SessionFile
+ENV[GkeEnvironmentEnvVar] = EnvironmentName
+
+ENV['USE_GKE_GCLOUD_AUTH_PLUGIN'] = 'True'
+	# enables use of the gke-gcloud-auth-plugin to shut up a warning from kubectl
+	#   (in the future this will be needed, so we may as well accept it now)
+	# for installation info see here:
+	#   https://cloud.google.com/blog/products/containers-kubernetes/kubectl-auth-changes-in-gke
+	# or try:
+	#   $ gcloud components install gke-gcloud-auth-plugin
+
+ProjectName = Environment['project'] or raise "Couldn't find GCP project corresponding to environment"
+
+# Unfortunately we don't just grab credentials once any more -- in order for this gke-gcloud-auth-plugin to work when running a kubectl command, we need to always have the same context as gcloud itself has when it gets us the credentials, so we need to set the same environment variables that our `gcp-project` wrapper does.
+GcloudConfigDir = Config.cache_dir('gcloud-config', 'infrastructure.gcp.auth-script.config-dir')
+GcloudConfigurationName = "#{CompanyDirName}-#{ProjectName}"
+ENV['CLOUDSDK_CONFIG'] = GcloudConfigDir
+ENV['CLOUDSDK_ACTIVE_CONFIG_NAME'] = GcloudConfigurationName
+
+context = `kubectl config current-context`
+unless $?.success?
+	system(
+		'gcp-project', ProjectName,
+		*%w[container clusters get-credentials],
+		'--zone', Environment['zone'],
+		Environment['cluster_name'],
+	)
+	unless $?.success?
+		exit $?.exitstatus
+	end
+end
+
+if ['-','--'].include? ARGV[0]
+	exec(*ARGV[1..-1])
+else
+	exec('kubectl', *ARGV)
+end
